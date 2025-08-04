@@ -8,8 +8,27 @@ from PIL import Image
 import requests
 import numpy as np
 
-# Set wide layout
-st.set_page_config(layout="wide")
+# Set wide layout and sidebar width
+st.set_page_config(layout="wide", initial_sidebar_state="expanded")
+st.markdown("""
+    <style>
+        section[data-testid="stSidebar"] {
+            min-width: 350px;
+            width: 350px;
+        }
+        div[data-testid="stNumberInput"] input {
+            height: 2.2em;
+            font-size: 1.1em;
+        }
+        div[data-testid="stForm"] {
+            padding: 2rem;
+        }
+        div[data-testid="stImage"] img {
+            max-width: 100%;
+            height: auto;
+        }
+    </style>
+    """, unsafe_allow_html=True)
 
 # --- CONFIG ---
 GCS_BUCKET = "veytel-cloud-store"
@@ -19,7 +38,7 @@ FLAG_LOG_FILE = "flag_log.json"
 PAGE_LOG_FILE = "page_log.json"
 VALID_USERS = sorted(["Ellen", "Cathy", "Robin", "Anrey", "Song", "Kevin", "Swathi", "Nitya", "Manasvi",
                       "Rachel", "Mike", "Paul", "Test_1", "Test_2", "Test_3"])
-PASSWORD = "Veytel2025"
+PASSWORD = "PulsarAIFlagger!"
 
 # --- GCS CLIENT ---
 def get_gcs_client():
@@ -31,18 +50,21 @@ def gcs_get_blob_url(bucket_name, blob_path):
     blob = bucket.blob(blob_path)
     return blob.generate_signed_url(version="v4", expiration=3600)
 
-def get_image(url, size=(256, 256), mode="RGB"):
+@st.cache_data(show_spinner=False)
+def get_image_cached(url, size=(256, 256), mode="RGB"):
     response = requests.get(url)
-    return Image.open(BytesIO(response.content)).convert(mode).resize(size)
+    img = Image.open(BytesIO(response.content)).convert(mode).resize(size)
+    return np.array(img)
 
-def overlay_mask_on_image(base_img, mask_array, color=(0, 255, 0), alpha=128):
+def overlay_mask_on_image_np(base_np, mask_array, color=(0, 255, 0), alpha=128):
+    base_img = Image.fromarray(base_np).convert("RGBA")
     overlay = Image.new("RGBA", base_img.size, (0, 0, 0, 0))
     pixels = overlay.load()
     for y in range(base_img.size[1]):
         for x in range(base_img.size[0]):
             if mask_array[y, x] > 0:
                 pixels[x, y] = color + (alpha,)
-    return Image.alpha_composite(base_img.convert("RGBA"), overlay).convert("RGB")
+    return np.array(Image.alpha_composite(base_img, overlay).convert("RGB"))
 
 # --- LOGIN ---
 def login():
@@ -115,27 +137,33 @@ def main():
         else:
             view_df = master_df
 
-        total_pages = max(1, (len(view_df) - 1) // 50 + 1)
+        total_pages = max(1, (len(view_df) - 1) // default_settings["page_size"] + 1)
+
         if "page_number" not in st.session_state:
             st.session_state.page_number = default_settings["page_number"]
         if "page_size" not in st.session_state:
             st.session_state.page_size = default_settings["page_size"]
 
-        # Clamp page number within valid range
-        st.session_state.page_number = max(1, min(st.session_state.page_number, total_pages))
+        # Ensure current page is within bounds
+        st.session_state.page_number = max(1, min(int(st.session_state.page_number), total_pages))
 
-        # Now render the input safely
-        st.session_state.page_number = st.number_input(
-            "Page", min_value=1, max_value=total_pages,
-            value=st.session_state.page_number, step=1, key="page_input"
-        )
+        page_col1, page_col2 = st.columns([2, 2])
+        with page_col1:
+            page_input = st.number_input(
+                "Page", min_value=1, max_value=total_pages,
+                value=int(st.session_state.page_number), step=1,
+                label_visibility="visible"
+            )
+            if page_input != st.session_state.page_number:
+                st.session_state.page_number = int(page_input)
+                st.rerun()
 
-        st.session_state.page_size = st.selectbox("Images per page", [10, 50, 100, 500],
-                                                  index=[10, 50, 100, 500].index(default_settings["page_size"]))
+        with page_col2:
+            st.session_state.page_size = st.selectbox("Images per page", [10, 50, 100, 500],
+                                                      index=[10, 50, 100, 500].index(default_settings["page_size"]))
 
         st.markdown(f"**📄 Viewing page {st.session_state.page_number} / {total_pages}**")
 
-        # Save to log
         page_log[user] = {"page_number": st.session_state.page_number, "page_size": st.session_state.page_size}
         with open(PAGE_LOG_FILE, "w") as f:
             json.dump(page_log, f, indent=2)
@@ -169,50 +197,75 @@ def main():
             st.session_state.clear()
             st.rerun()
 
-    # --- Pagination ---
     start_idx = (st.session_state.page_number - 1) * st.session_state.page_size
     end_idx = start_idx + st.session_state.page_size
     page_df = view_df.iloc[start_idx:end_idx]
 
-    for idx, row in page_df.iterrows():
-        with st.container():
-            cols = st.columns([1, 1, 1, 1])
-            norm_img = get_image(gcs_get_blob_url(GCS_BUCKET, row["normalizedPath"]))
-            old_mask = np.array(get_image(gcs_get_blob_url(GCS_BUCKET, row["maskPath_old"]), mode="L"))
-            new_mask = np.array(get_image(gcs_get_blob_url(GCS_BUCKET, row["maskPath"]), mode="L"))
+    with st.form("flagging_form", clear_on_submit=False):
+        for idx, row in page_df.iterrows():
+            with st.container():
+                cols = st.columns([1, 1, 1, 1])
+                norm_np = get_image_cached(gcs_get_blob_url(GCS_BUCKET, row["normalizedPath"]))
+                old_mask = get_image_cached(gcs_get_blob_url(GCS_BUCKET, row["maskPath_old"]), mode="L")
+                new_mask = get_image_cached(gcs_get_blob_url(GCS_BUCKET, row["maskPath"]), mode="L")
 
-            with cols[0]:
-                st.image(norm_img, caption="Normalized", width=256)
-            with cols[1]:
-                st.image(overlay_mask_on_image(norm_img, old_mask, color=(0, 255, 0)), caption="Old Mask Overlay", width=256)
-            with cols[2]:
-                st.image(overlay_mask_on_image(norm_img, new_mask, color=(255, 0, 0)), caption="New Mask Overlay", width=256)
-            with cols[3]:
-                both_overlay = overlay_mask_on_image(overlay_mask_on_image(norm_img, old_mask, color=(0, 255, 0), alpha=128),
-                                                     new_mask, color=(255, 0, 0), alpha=128)
-                st.image(both_overlay, caption="Intersection", width=256)
+                norm_pil = Image.fromarray(norm_np)
+                old_overlay = Image.fromarray(overlay_mask_on_image_np(norm_np, old_mask, color=(0, 255, 0)))
+                new_overlay = Image.fromarray(overlay_mask_on_image_np(norm_np, new_mask, color=(255, 0, 0)))
+                both_overlay = Image.fromarray(
+                    overlay_mask_on_image_np(
+                        overlay_mask_on_image_np(norm_np, old_mask, color=(0, 255, 0), alpha=128),
+                        new_mask, color=(255, 0, 0), alpha=128
+                    )
+                )
 
-        flag_cols = st.columns(4)
-        with flag_cols[0]:
-            with st.expander(" More details"):
-                st.markdown(f"- **Image Name**: `{row.get('imgName', 'N/A')}`")
-                st.markdown(f"- **Image Quality**: `{row.get('imgQuality', 'N/A')}`")
-                st.markdown(f"- **Left Atelectasis**: `{row.get('left_atelectasis', 'N/A')}`")
-                st.markdown(f"- **Right Atelectasis**: `{row.get('right_atelectasis', 'N/A')}`")
-                st.markdown(f"- **RALE Score**: `{row.get('RALE', 'N/A')}`")
-                st.markdown(f"- **mRALE**: `{row.get('mRALE', 'N/A')}`")
-        with flag_cols[3]:
-            key = f"flag_{idx}_{row['imgName']}"
-            initial = user in flag_log.get(row["imgName"], [])
-            new_flagged = st.checkbox(" Flag Image ", key=key, value=initial)
-            if new_flagged != initial:
-                if new_flagged:
-                    flag_log.setdefault(row["imgName"], []).append(user)
-                else:
-                    flag_log[row["imgName"]].remove(user)
-                    if not flag_log[row["imgName"]]:
-                        del flag_log[row["imgName"]]
+                with cols[0]:
+                    st.image(norm_pil, caption="Normalized", width=256)
+                with cols[1]:
+                    st.image(old_overlay, caption="Old Mask Overlay", width=256)
+                with cols[2]:
+                    st.image(new_overlay, caption="New Mask Overlay", width=256)
+                with cols[3]:
+                    st.image(both_overlay, caption="Intersection", width=256)
+
+            flag_cols = st.columns(4)
+            with flag_cols[0]:
+                with st.expander(" More details"):
+                    st.markdown(f"- **Image Name**: `{row.get('imgName', 'N/A')}`")
+                    st.markdown(f"- **Image Quality**: `{row.get('imgQuality', 'N/A')}`")
+                    st.markdown(f"- **Left Atelectasis**: `{row.get('left_atelectasis', 'N/A')}`")
+                    st.markdown(f"- **Right Atelectasis**: `{row.get('right_atelectasis', 'N/A')}`")
+                    st.markdown(f"- **RALE Score**: `{row.get('RALE', 'N/A')}`")
+                    st.markdown(f"- **mRALE**: `{row.get('mRALE', 'N/A')}`")
+            with flag_cols[3]:
+                key = f"flag_{idx}_{row['imgName']}"
+                initial = user in flag_log.get(row["imgName"], [])
+                new_flagged = st.checkbox(" Flag Image ", key=key, value=initial)
+
+                if "pending_flag_updates" not in st.session_state:
+                    st.session_state.pending_flag_updates = {}
+
+                if new_flagged != initial:
+                    st.session_state.pending_flag_updates[row["imgName"]] = new_flagged
+
+        submitted = st.form_submit_button("✅ Save Flags")
+        if submitted and "pending_flag_updates" in st.session_state:
+            changed = False
+            for img_name, is_flagged in st.session_state.pending_flag_updates.items():
+                was_flagged = user in flag_log.get(img_name, [])
+                if is_flagged and not was_flagged:
+                    flag_log.setdefault(img_name, []).append(user)
+                    changed = True
+                elif not is_flagged and was_flagged:
+                    flag_log[img_name].remove(user)
+                    if not flag_log[img_name]:
+                        del flag_log[img_name]
+                    changed = True
+
+            if changed:
                 save_flag_log(flag_log)
+            st.session_state.pending_flag_updates = {}
+            st.rerun()
 
 # --- START ---
 if "user" not in st.session_state:
