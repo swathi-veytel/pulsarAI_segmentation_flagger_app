@@ -276,7 +276,7 @@ def main():
             st.markdown("---")
             st.markdown(f"**{idx + 1}. Image Name:** `{row.get('imgName', 'N/A')}`")
 
-            cols = st.columns([1, 1, 1, 1])
+
 
             # use blob-path cached loaders so reruns don't refetch
             norm_np = load_image_np_from_blob(row["normalizedPath"])
@@ -293,14 +293,16 @@ def main():
                 )
             )
 
+            cols = st.columns(4, gap="small")
+
             with cols[0]:
-                st.image(norm_pil, caption="Normalized", width=256)
+                st.image(norm_pil, caption="Normalized", use_container_width=True)
             with cols[1]:
-                st.image(old_overlay, caption="Old Mask Overlay", width=256)
+                st.image(old_overlay, caption="Old Mask Overlay", use_container_width=True)
             with cols[2]:
-                st.image(new_overlay, caption="New Mask Overlay", width=256)
+                st.image(new_overlay, caption="New Mask Overlay", use_container_width=True)
             with cols[3]:
-                st.image(both_overlay, caption="Intersection", width=256)
+                st.image(both_overlay, caption="Intersection", use_container_width=True)
 
             flag_cols = st.columns([2, 2, 2, 2])
             with flag_cols[0]:
