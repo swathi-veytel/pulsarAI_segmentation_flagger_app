@@ -37,8 +37,6 @@ st.markdown("""
 GCS_BUCKET = "veytel-cloud-store"
 MASTER_CSV_PATH = "pulsarai_masters/master_250723.csv"
 SERVICE_ACCOUNT_JSON = st.secrets["gcs_service_account"]
-FLAG_LOG_FILE = "flag_log.json"   # kept for minimal diffs (unused)
-PAGE_LOG_FILE = "page_log.json"   # kept for minimal diffs (unused)
 VALID_USERS = sorted(["Ellen", "Cathy", "Robin", "Anrey", "Song", "Kevin", "Swathi", "Nitya", "Manasvi",
                       "Rachel", "Mike", "Paul", "Test_1", "Test_2", "Test_3"])
 PASSWORD = "PulsarAIFlagger!"
@@ -54,11 +52,6 @@ def user_page_log_path(user: str) -> str:
 # --- GCS CLIENT ---
 def get_gcs_client():
     return storage.Client.from_service_account_info(SERVICE_ACCOUNT_JSON)
-def gcs_get_blob_url(bucket_name, blob_path):
-    client = get_gcs_client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_path)
-    return blob.generate_signed_url(version="v4", expiration=3600)
 
 # --- GCS helpers ---
 def gcs_read_json(bucket_name: str, blob_path: str, default):
@@ -77,13 +70,6 @@ def gcs_list_json_paths(bucket_name: str, prefix: str):
     return [b.name for b in client.list_blobs(bucket_name, prefix=prefix) if b.name.endswith(".json")]
 
 @st.cache_data(show_spinner=False)
-def get_image_cached(url, size=(256, 256), mode="RGB"):
-    response = requests.get(url)
-    img = Image.open(BytesIO(response.content)).convert(mode).resize(size)
-    return np.array(img)
-
-# cache by blob path so reruns don’t refetch
-@st.cache_data(show_spinner=False)
 def load_image_np_from_blob(blob_path, size=(256, 256), mode="RGB"):
     client = get_gcs_client()
     bucket = client.bucket(GCS_BUCKET)
@@ -101,6 +87,18 @@ def overlay_mask_on_image_np(base_np, mask_array, color=(0, 255, 0), alpha=128):
             if mask_array[y, x] > 0:
                 pixels[x, y] = color + (alpha,)
     return np.array(Image.alpha_composite(base_img, overlay).convert("RGB"))
+
+def load_user_page_data(user: str) -> dict:
+    # default includes assigned_page = 1
+    return gcs_read_json(GCS_BUCKET, user_page_log_path(user), default={"page_number": 1, "assigned_page": 1})
+
+def save_user_page_data(user: str, page_number: int = None, assigned_page: int = None):
+    data = load_user_page_data(user)
+    if page_number is not None:
+        data["page_number"] = int(page_number)
+    if assigned_page is not None:
+        data["assigned_page"] = int(assigned_page)
+    gcs_write_json(GCS_BUCKET, user_page_log_path(user), data)
 
 # --- LOGIN ---
 def login():
@@ -132,10 +130,11 @@ def load_master():
 # --- per-user flags helpers ---
 def load_user_flags(user: str) -> set:
     return set(gcs_read_json(GCS_BUCKET, user_flag_log_path(user), default=[]))
+
 def save_user_flags(user: str, flags_set: set):
     gcs_write_json(GCS_BUCKET, user_flag_log_path(user), sorted(list(flags_set)))
 
-# --- aggregated flags map (authoritative for views/exports) ---
+# --- aggregated flags map ---
 def load_flag_log(cache_bust: int):
     @st.cache_data(show_spinner=False)
     def _load_all_flags(_bust: int):
@@ -147,27 +146,17 @@ def load_flag_log(cache_bust: int):
             u = os.path.basename(path).split("_flag_log.json")[0]
             flagged_list = gcs_read_json(GCS_BUCKET, path, default=[])
             for img in flagged_list:
-                img_key = os.path.basename(str(img)).strip()  # normalize
+                img_key = os.path.basename(str(img)).strip()
                 img_to_users.setdefault(img_key, set()).add(u)
         return {k: sorted(list(v)) for k, v in img_to_users.items()}
     return _load_all_flags(cache_bust)
 
-# --- page number per-user in GCS ---
-def load_user_page_number(user: str) -> int:
-    data = gcs_read_json(GCS_BUCKET, user_page_log_path(user), default={"page_number": 1})
-    try:
-        return int(data.get("page_number", 1))
-    except Exception:
-        return 1
-def save_user_page_number(user: str, page_number: int):
-    gcs_write_json(GCS_BUCKET, user_page_log_path(user), {"page_number": int(page_number)})
-
-# --- apply pending updates by reading/writing ONLY the user’s file ---
+# --- apply pending updates ---
 def flush_pending_flags_to_gcs(user: str):
     pending = st.session_state.get("pending_flag_updates", {})
     if not pending:
         return False
-    user_set = load_user_flags(user)  # source of truth
+    user_set = load_user_flags(user)
     changed = False
     for img_name, is_flagged in pending.items():
         img_key = os.path.basename(str(img_name)).strip()
@@ -184,22 +173,30 @@ def flush_pending_flags_to_gcs(user: str):
 # --- MAIN ---
 def main():
     user = st.session_state.user
+    page_data = load_user_page_data(user)
+    page_number = page_data.get("page_number", 1)
+    assigned_page = page_data.get("assigned_page", 1)
 
     flags_refresh = st.session_state.get("flags_refresh", 0)
-    default_settings = {"page_number": load_user_page_number(user), "page_size": 25}
+    default_settings = {"page_number": page_number, "page_size": 25}
 
     master_df = load_master()
-    # normalize imgName in master so it matches JSON keys
     master_df["imgName"] = master_df["imgName"].astype(str).str.strip()
 
-    # aggregated mapping for views/exports
-    flag_log = load_flag_log(flags_refresh)          # dict: imgName -> [users]
-    all_flagged_set = set(flag_log.keys())           # all flagged images (any user)
-    user_flag_set = load_user_flags(user)            # current user’s own set
+    flag_log = load_flag_log(flags_refresh)
+    all_flagged_set = set(flag_log.keys())
+    user_flag_set = load_user_flags(user)
 
     with st.sidebar:
         st.markdown("\U0001FA7B PulsarAI Segmentation Flagging Tool")
         st.markdown(f"**👤 Logged in as:** `{user}`")
+
+        # Show assigned range if available
+        assigned_start = page_data.get("assigned_start")
+        assigned_end = page_data.get("assigned_end")
+        if assigned_start and assigned_end:
+            st.markdown(f"**📖 Assigned Pages:** {assigned_start}-{assigned_end}")
+
         st.markdown("### View Options")
 
         view_mode = st.selectbox("View Mode", ["All Images", "Flagged Images", "Flagged by Selected Users"], key="view_mode_select")
@@ -208,7 +205,6 @@ def main():
 
         selected_users = st.multiselect("Select Users", VALID_USERS) if view_mode == "Flagged by Selected Users" else []
 
-        # --- BUILD VIEWS FROM THE MAP, NOT A COLUMN ---
         if view_mode == "Flagged Images":
             view_df = master_df[master_df["imgName"].isin(all_flagged_set)]
         elif view_mode == "Flagged by Selected Users":
@@ -218,14 +214,12 @@ def main():
         else:
             view_df = master_df
 
-        # pagination (fixed 25)
         if "page_number" not in st.session_state:
             st.session_state.page_number = default_settings["page_number"]
         st.session_state.page_size = 25
 
-        # restore saved page when returning to All Images
         if st.session_state.prev_view_mode != view_mode and view_mode == "All Images":
-            st.session_state.page_number = load_user_page_number(user)
+            st.session_state.page_number = page_data.get("page_number", 1)
 
         total_pages = max(1, (len(view_df) - 1) // st.session_state.page_size + 1)
         st.session_state.page_number = max(1, min(st.session_state.page_number, total_pages))
@@ -233,13 +227,22 @@ def main():
         st.markdown(f"### page {st.session_state.page_number} / {total_pages}")
         st.markdown(f"#### Images per page: 25")
 
+        # --- Jump to Page dropdown ---
+        st.markdown("### Jump To Page")
+        page_labels = [f"Page {i} ({(i-1)*st.session_state.page_size+1}-{min(i*st.session_state.page_size, len(view_df))})"
+                       for i in range(1, total_pages+1)]
+        selected_page_label = st.selectbox("Select Page", options=page_labels, index=st.session_state.page_number-1)
+        selected_page_num = page_labels.index(selected_page_label) + 1
+        if st.button("Go to Page", use_container_width=True, key="jump_page_btn"):
+            st.session_state.page_number = selected_page_num
+            st.rerun()
+
         st.markdown("### ⬇ Export Options")
         export_option = st.selectbox(
             "Select export option",
             ["Select...", "⬇ Full Master file with Flagged column", "⬇ Master file without Flagged Images"]
         )
 
-        # --- EXPORTS BUILT FROM THE MAP ---
         if export_option == "⬇ Full Master file with Flagged column":
             export_df_full = master_df.copy()
             export_df_full["flagged_by"] = export_df_full["imgName"].map(lambda x: ", ".join(flag_log.get(x, [])))
@@ -265,20 +268,18 @@ def main():
 
         st.session_state.prev_view_mode = view_mode
 
-    # current page slice
+    # --- Page Slice ---
     start_idx = (st.session_state.page_number - 1) * st.session_state.page_size
     end_idx = start_idx + st.session_state.page_size
     page_df = view_df.iloc[start_idx:end_idx]
 
-    # --- FORM: save-only, save&prev, save&next ---
+    # --- FORM for Flags ---
     with st.form("flagging_form", clear_on_submit=False):
         for idx, row in page_df.iterrows():
+            img_name = row.get("imgName", "N/A")
             st.markdown("---")
-            st.markdown(f"**{idx + 1}. Image Name:** `{row.get('imgName', 'N/A')}`")
+            st.markdown(f"**{idx + 1}. Image Name:** `{img_name}`")
 
-
-
-            # use blob-path cached loaders so reruns don't refetch
             norm_np = load_image_np_from_blob(row["normalizedPath"])
             old_mask = load_image_np_from_blob(row["maskPath_old"], mode="L")
             new_mask = load_image_np_from_blob(row["maskPath"], mode="L")
@@ -294,65 +295,39 @@ def main():
             )
 
             cols = st.columns(4, gap="small")
-
-            with cols[0]:
-                st.image(norm_pil, caption="Normalized", use_container_width=True)
-            with cols[1]:
-                st.image(old_overlay, caption="Old Mask Overlay", use_container_width=True)
-            with cols[2]:
-                st.image(new_overlay, caption="New Mask Overlay", use_container_width=True)
-            with cols[3]:
-                st.image(both_overlay, caption="Intersection", use_container_width=True)
+            with cols[0]: st.image(norm_pil, caption="Normalized", use_container_width=True)
+            with cols[1]: st.image(old_overlay, caption="Old Mask Overlay", use_container_width=True)
+            with cols[2]: st.image(new_overlay, caption="New Mask Overlay", use_container_width=True)
+            with cols[3]: st.image(both_overlay, caption="Intersection", use_container_width=True)
 
             flag_cols = st.columns([2, 2, 2, 2])
-            with flag_cols[0]:
-                with st.expander(" More details"):
-                    st.markdown(f"- **Image Quality**: `{row.get('imgQuality', 'N/A')}`")
-                    st.markdown(f"- **Left Atelectasis**: `{row.get('left_atelectasis', 'N/A')}`")
-                    st.markdown(f"- **Right Atelectasis**: `{row.get('right_atelectasis', 'N/A')}`")
-                    st.markdown(f"- **RALE Score**: `{row.get('RALE', 'N/A')}`")
-                    st.markdown(f"- **mRALE**: `{row.get('mRALE', 'N/A')}`")
-
             with flag_cols[3]:
-                key = f"flag_{idx}_{row['imgName']}"
-                # checkbox initial from the current user’s file
-                initial = (row["imgName"] in user_flag_set)
+                key = f"flag_{idx}_{img_name}"
+                initial = (img_name in user_flag_set)
                 new_flagged = st.checkbox(" Flag Image ", key=key, value=initial)
-
                 if "pending_flag_updates" not in st.session_state:
                     st.session_state.pending_flag_updates = {}
                 if new_flagged != initial:
-                    st.session_state.pending_flag_updates[row["imgName"]] = new_flagged
+                    st.session_state.pending_flag_updates[img_name] = new_flagged
 
-        # Three submit buttons inside the form:
         c1, c2, c3 = st.columns([1, 1, 1])
-        with c1:
-            prev_and_save = st.form_submit_button("⬅ Prev")
-        with c2:
-            save_only = st.form_submit_button("✅ Save Flags")
-        with c3:
-            next_and_save = st.form_submit_button("Next ➡")
+        with c1: prev_and_save = st.form_submit_button("⬅ Prev")
+        with c2: save_only = st.form_submit_button("✅ Save Flags")
+        with c3: next_and_save = st.form_submit_button("Next ➡")
 
         if prev_and_save or save_only or next_and_save:
-            # Save flags first (if any changed)
             if flush_pending_flags_to_gcs(user):
                 st.success("Flags saved.")
-
-            # Navigate only after saving, and only if prev/next pressed
             if prev_and_save:
                 if st.session_state.page_number > 1:
                     st.session_state.page_number -= 1
-                    if st.session_state.prev_view_mode == "All Images":
-                        save_user_page_number(user, st.session_state.page_number)
+                    save_user_page_data(user, st.session_state.page_number)
                 st.rerun()
             if next_and_save:
-                total_pages = max(1, (len(view_df) - 1) // st.session_state.page_size + 1)
                 if st.session_state.page_number < total_pages:
                     st.session_state.page_number += 1
-                    if st.session_state.prev_view_mode == "All Images":
-                        save_user_page_number(user, st.session_state.page_number)
+                    save_user_page_data(user, st.session_state.page_number)
                 st.rerun()
-            # If only saved, just rerun to refresh flagged views
             if save_only:
                 st.rerun()
 
